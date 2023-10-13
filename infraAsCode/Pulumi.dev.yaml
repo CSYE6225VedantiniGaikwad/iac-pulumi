@@ -1,0 +1,9 @@
+config:
+  aws:profile: dev
+  aws:region: us-west-1
+  iac_pulumi_01:data:
+    active: true
+    no_of_subnets: 6 # desired level
+    vpcCidr: 10.1.0.0/16
+    vpcName: devenv
+    destination_cidr_block: 0.0.0.0/0
