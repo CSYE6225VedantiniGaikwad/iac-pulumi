@@ -2,6 +2,7 @@ import pulumi
 import pulumi_aws as aws
 import ipaddress
 
+
 def calculate_subnets(vpc_cidr, num_subnets):
     try:
         vpc_network = ipaddress.IPv4Network(vpc_cidr)
@@ -19,6 +20,7 @@ def calculate_subnets(vpc_cidr, num_subnets):
 # Fetch the configuration values
 config = pulumi.Config()
 data = config.require_object("data")
+rds_config = config.require_object("rds")
 
 # Extract key configuration values
 vpc_name = data.get("vpcName")
@@ -36,11 +38,11 @@ Virtual_private_cloud = aws.ec2.Vpc(vpc_name,
 azs = aws.get_availability_zones().names
 num_azs = len(azs)
 
-no_of_subnets = 3  # max
+no_of_subnets = data.get("no_of_subnets_AZ")  # max
 
 print(num_azs)
 
-if (num_azs < 3):
+if num_azs < 3:
     no_of_subnets = num_azs
 # Create 3 public and 3 private subnets
 public_subnets = []
@@ -114,52 +116,115 @@ public_route = aws.ec2.Route(f"{vpc_name}-public-route",
                              destination_cidr_block="0.0.0.0/0",
                              gateway_id=internet_gateway.id)
 
-def create_security_group(vpc_id, destination_block):
-    security_group = aws.ec2.SecurityGroup("AppSecurityGrp",
-                                           description='Application security group',
-                                           vpc_id=vpc_id,
-                                           ingress=[
-                                               {
-                                                   'Description': 'TLS from VPC for port 22',
-                                                   'FromPort': 22,
-                                                   'ToPort': 22,
-                                                   'Protocol': 'tcp',
-                                                   'CidrBlocks': [destination_block],
-                                                   'Ipv6CidrBlocks': ['::/0'],
-                                               },
-                                               {
-                                                   'Description': 'TLS from VPC for port 80',
-                                                   'FromPort': 80,
-                                                   'ToPort': 80,
-                                                   'Protocol': 'tcp',
-                                                   'CidrBlocks': [destination_block],
-                                                   'Ipv6CidrBlocks': ['::/0'],
-                                               },
-                                               {
-                                                   'Description': 'TLS from VPC for port 443',
-                                                   'FromPort': 443,
-                                                   'ToPort': 443,
-                                                   'Protocol': 'tcp',
-                                                   'CidrBlocks': [destination_block],
-                                                   'Ipv6CidrBlocks': ['::/0'],
-                                               },
-                                               {
-                                                   'Description': 'TLS from VPC for port 8080',
-                                                   'FromPort': 8080,
-                                                   'ToPort': 8080,
-                                                   'Protocol': 'tcp',
-                                                   'CidrBlocks': [destination_block],
-                                                   'Ipv6CidrBlocks': ['::/0'],
-                                               },
-                                           ],
-                                           egress=[],
-                                           )
+
+def create_security_groups(vpc_id, destination_block):
+    application_security_group = aws.ec2.SecurityGroup(
+        "AppSecurityGrp",
+        description='Application security group',
+        vpc_id=vpc_id,
+        ingress=[
+            {
+                'Description': 'TLS from VPC for port 22',
+                'FromPort': 22,
+                'ToPort': 22,
+                'Protocol': 'tcp',
+                'CidrBlocks': [destination_block],
+                'Ipv6CidrBlocks': ['::/0'],
+            },
+            {
+                'Description': 'TLS from VPC for port 80',
+                'FromPort': 80,
+                'ToPort': 80,
+                'Protocol': 'tcp',
+                'CidrBlocks': [destination_block],
+                'Ipv6CidrBlocks': ['::/0'],
+            },
+            {
+                'Description': 'TLS from VPC for port 443',
+                'FromPort': 443,
+                'ToPort': 443,
+                'Protocol': 'tcp',
+                'CidrBlocks': [destination_block],
+                'Ipv6CidrBlocks': ['::/0'],
+            },
+            {
+                'Description': 'TLS from VPC for port 8080',
+                'FromPort': 8080,
+                'ToPort': 8080,
+                'Protocol': 'tcp',
+                'CidrBlocks': [destination_block],
+                'Ipv6CidrBlocks': ['::/0'],
+            },
+        ],
+        egress=[
+            {
+                'FromPort': 0,
+                'ToPort': 0,
+                'Protocol': '-1',
+                'CidrBlocks': ["0.0.0.0/0"]  # Restrict access to the internet
+            }
+        ],
+    )
+
+    database_security_group = aws.ec2.SecurityGroup(
+        "DatabaseSecurityGroup",
+        description="RDS security group",
+        vpc_id=vpc_id,
+        ingress=[
+            {
+                'FromPort': 5432,
+                'ToPort': 5432,
+                'Protocol': 'tcp',
+                'security_groups': [application_security_group.id],
+            },
+        ],
+        egress=[],
+    )
+
+    security_group = [application_security_group, database_security_group]
 
     return security_group
 
 
-def lookup_ami():
+def create_parameter_group():
+    return (aws.rds.ParameterGroup(
+        "csye6225-rds-parameter-group",
+        family='postgres15',
+        description='Custom parameter group for PostgresSQL'
+    ))
 
+
+def create_rds_instance(subnet_id, database_security_group):
+    database_parameter_group = create_parameter_group()
+    database_instance = aws.rds.Instance(
+        "csye6225",
+        allocated_storage=20,
+        storage_type=rds_config.get("storage_type"),
+        db_name=rds_config.get("db_name"),
+        engine=rds_config.get("engine"),
+        engine_version=rds_config.get("engine_version"),
+        instance_class=rds_config.get("instance_class"),
+        parameter_group_name=database_parameter_group.name,
+        password=rds_config.get("password"),
+        db_subnet_group_name=get_subnet_group(),
+        skip_final_snapshot=True,
+        username=rds_config.get("username"),
+        multi_az=False,
+        publicly_accessible=False,
+        vpc_security_group_ids=[database_security_group],
+    )
+    return database_instance.address
+
+
+def get_subnet_group():
+    database_subnet_group = aws.rds.SubnetGroup(
+        "csye6225subnetgroup",
+        subnet_ids=private_subnets,
+    )
+    return database_subnet_group.name
+
+
+def lookup_ami():
     ami = aws.ec2.get_ami(
         executable_users=["self"],
         filters=[
@@ -183,22 +248,57 @@ def lookup_ami():
     return ami.id
 
 
-def create_instance(ami_id, subnet_id, security_group_id):
-    ami_id = 'ami-023195746d6d1aa0d'
+def create_instance(ami_id, subnet_id, security_group):
+    # ami_id = 'ami-011763bb2066fb36d'
 
-    instance = aws.ec2.Instance("instance",
-                                ami=ami_id,
-                                instance_type="t2.micro",
-                                subnet_id=subnet_id,
-                                key_name="ec2",
-                                root_block_device=aws.ec2.InstanceRootBlockDeviceArgs(
-                                    volume_type=data.get("root_volume_type"),
-                                    volume_size=data.get("root_volume_size"),
-                                    delete_on_termination=True
-                                ),
-                                disable_api_termination=False,
-                                vpc_security_group_ids=[security_group_id])
+    # Create the rds instance
+    rds_instance = create_rds_instance(private_subnets[1], security_group[1].id)
 
+    # with open(file=app_properties_file, mode='r') as file:
+    #    static_properties = file.read()
+
+    app_properties = '/tmp/applications.properties'
+
+    rds_instance_hostname = pulumi.Output.concat(
+        "jdbc:postgresql://",
+        rds_instance,
+        ":5432/",
+        rds_config.get("db_name")
+    )
+
+    user_data = [
+        "#!/bin/bash",
+        f"echo 'spring.jpa.hibernate.ddl-auto=update' >> {app_properties}",
+        f"echo 'spring.datasource.hikari.initialization-fail-timeout=-1' >> {app_properties}",
+        f"echo 'spring.datasource.hikari.connection-timeout=2000' >> {app_properties}",
+        f"echo 'spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect' >> {app_properties}",
+        f"echo 'logging.level.org.springframework=debug' >> {app_properties}",
+        f"echo 'spring.datasource.username={rds_config.get('username')}' >> {app_properties}",
+        f"echo 'spring.datasource.password={rds_config.get('password')}' >> {app_properties}"
+    ]
+
+    user_data = pulumi.Output.concat(
+        "\n".join(user_data),
+        "\n",
+        rds_instance_hostname.apply(func=lambda x: f"echo 'spring.datasource.url={x}' >> {app_properties}"))
+
+    user_data = pulumi.Output.concat(user_data, f"\nsudo mv {app_properties} /opt/application.properties", "\n")
+
+    instance = aws.ec2.Instance(
+        "instance",
+        ami=ami_id,
+        instance_type="t2.micro",
+        subnet_id=subnet_id,
+        key_name="ec2",
+        root_block_device=aws.ec2.InstanceRootBlockDeviceArgs(
+            volume_type=data.get("root_volume_type"),
+            volume_size=data.get("root_volume_size"),
+            delete_on_termination=True
+        ),
+        disable_api_termination=False,
+        vpc_security_group_ids=[security_group[0].id],
+        user_data=user_data,
+    ),
     return instance
 
 
@@ -207,11 +307,10 @@ def demo():
     destination_block = '0.0.0.0/0'
 
     # Create the security group.
-    security_group = create_security_group(vpc_id, destination_block)
+    security_group = create_security_groups(vpc_id, destination_block)
 
     # Create the EC2 instance.
-    instance = create_instance("ami_id", public_subnets[0], security_group.id)
+    instance = create_instance(data.get("ami_id"), public_subnets[0], security_group)
 
 
 demo()
-
