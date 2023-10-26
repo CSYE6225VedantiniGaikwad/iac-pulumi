@@ -8,7 +8,7 @@ This project demonstrates the creation of a Virtual Private Cloud (VPC) along wi
 * Getting Started
 * Deployment
 
-### Introduction ###
+#### Introduction ####
 This project automates the creation of a VPC with a specific configuration that includes:
 
 1. Creating a VPC in a specified region.
