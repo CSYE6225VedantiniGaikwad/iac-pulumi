@@ -21,6 +21,7 @@ def calculate_subnets(vpc_cidr, num_subnets):
 config = pulumi.Config()
 data = config.require_object("data")
 rds_config = config.require_object("rds")
+route53_config = config.require_object("route53")
 
 # Extract key configuration values
 vpc_name = data.get("vpcName")
@@ -248,6 +249,31 @@ def lookup_ami():
     return ami.id
 
 
+def create_iam_role():
+    # Create an IAM Role
+    iam_cloudwatch_role = aws.iam.Role(
+        "CloudWatch_Role",
+        assume_role_policy="""{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole",
+                "Sid": ""
+                }
+            ]
+        }""")
+    aws.iam.RolePolicyAttachment(
+        "CloudWatchAgentServerPolicy",
+        role=iam_cloudwatch_role.name,
+        policy_arn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+    )
+    return iam_cloudwatch_role
+
+
 def create_instance(ami_id, subnet_id, security_group):
     # ami_id = 'ami-011763bb2066fb36d'
 
@@ -274,7 +300,12 @@ def create_instance(ami_id, subnet_id, security_group):
         f"echo 'spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect' >> {app_properties}",
         f"echo 'logging.level.org.springframework=debug' >> {app_properties}",
         f"echo 'spring.datasource.username={rds_config.get('username')}' >> {app_properties}",
-        f"echo 'spring.datasource.password={rds_config.get('password')}' >> {app_properties}"
+        f"echo 'spring.datasource.password={rds_config.get('password')}' >> {app_properties}",
+        f"echo 'env.domain=localhost' >> {app_properties}",
+        f"echo 'env.port=8125' >> {app_properties}",
+        f"echo 'management.statsd.metrics.export.host=localhost' >> {app_properties}",
+        f"echo 'management.statsd.metrics.export.port=8125' >> {app_properties}",
+        f"echo 'management.endpoints.web.exposure.include=metrics' >> {app_properties}",
     ]
 
     user_data = pulumi.Output.concat(
@@ -283,6 +314,37 @@ def create_instance(ami_id, subnet_id, security_group):
         rds_instance_hostname.apply(func=lambda x: f"echo 'spring.datasource.url={x}' >> {app_properties}"))
 
     user_data = pulumi.Output.concat(user_data, f"\nsudo mv {app_properties} /opt/application.properties", "\n")
+    user_data = pulumi.Output.concat(user_data, "\nsudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config \
+    -m ec2 \
+    -c file:/opt/cloudwatch.json \
+    -s", "\n")
+
+    iam_cloudwatch_role = aws.iam.Role(
+        "CloudWatch_Role",
+        assume_role_policy="""{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole",
+                "Sid": ""
+                }
+            ]
+        }""")
+    aws.iam.RolePolicyAttachment(
+        "CloudWatchAgentServerPolicy",
+        role=iam_cloudwatch_role.name,
+        policy_arn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+    )
+
+    instance_profile = aws.iam.InstanceProfile(
+        "instance_profile",
+        role=iam_cloudwatch_role.name
+    )
 
     instance = aws.ec2.Instance(
         "instance",
@@ -298,8 +360,22 @@ def create_instance(ami_id, subnet_id, security_group):
         disable_api_termination=False,
         vpc_security_group_ids=[security_group[0].id],
         user_data=user_data,
+        iam_instance_profile=instance_profile.name,
     ),
     return instance
+
+
+def update_record_in_route53(instance):
+    my_zone = aws.route53.get_zone(name=route53_config.get("name"))
+    record = aws.route53.Record(
+        "route53_record",
+        type="A",
+        name=my_zone.name,
+        ttl=60,
+        records=[instance.public_ip],
+        zone_id=my_zone.zone_id
+    )
+    return record
 
 
 def demo():
@@ -311,6 +387,7 @@ def demo():
 
     # Create the EC2 instance.
     instance = create_instance(data.get("ami_id"), public_subnets[0], security_group)
+    update_record_in_route53(instance[0])
 
 
 demo()
