@@ -1,3 +1,5 @@
+import base64
+
 import pulumi
 import pulumi_aws as aws
 import ipaddress
@@ -119,6 +121,34 @@ public_route = aws.ec2.Route(f"{vpc_name}-public-route",
 
 
 def create_security_groups(vpc_id, destination_block):
+    load_balancer_security_group = aws.ec2.SecurityGroup(
+        "LoadBalancerSecurityGroup",
+        description="Load balancer security group",
+        vpc_id=vpc_id,
+        ingress=[
+            {
+                'FromPort': 80,
+                'ToPort': 80,
+                'Protocol': 'tcp',
+                'CidrBlocks': ["0.0.0.0/0"],
+            },
+            {
+                'FromPort': 443,
+                'ToPort': 443,
+                'Protocol': 'tcp',
+                'CidrBlocks': ["0.0.0.0/0"],
+            },
+        ],
+        egress=[
+            {
+                'FromPort': 0,
+                'ToPort': 0,
+                'Protocol': '-1',
+                'CidrBlocks': ["0.0.0.0/0"]
+            },
+        ],
+    )
+
     application_security_group = aws.ec2.SecurityGroup(
         "AppSecurityGrp",
         description='Application security group',
@@ -130,31 +160,13 @@ def create_security_groups(vpc_id, destination_block):
                 'ToPort': 22,
                 'Protocol': 'tcp',
                 'CidrBlocks': [destination_block],
-                'Ipv6CidrBlocks': ['::/0'],
-            },
-            {
-                'Description': 'TLS from VPC for port 80',
-                'FromPort': 80,
-                'ToPort': 80,
-                'Protocol': 'tcp',
-                'CidrBlocks': [destination_block],
-                'Ipv6CidrBlocks': ['::/0'],
-            },
-            {
-                'Description': 'TLS from VPC for port 443',
-                'FromPort': 443,
-                'ToPort': 443,
-                'Protocol': 'tcp',
-                'CidrBlocks': [destination_block],
-                'Ipv6CidrBlocks': ['::/0'],
             },
             {
                 'Description': 'TLS from VPC for port 8080',
                 'FromPort': 8080,
                 'ToPort': 8080,
                 'Protocol': 'tcp',
-                'CidrBlocks': [destination_block],
-                'Ipv6CidrBlocks': ['::/0'],
+                'security_groups': [load_balancer_security_group.id],
             },
         ],
         egress=[
@@ -162,7 +174,7 @@ def create_security_groups(vpc_id, destination_block):
                 'FromPort': 0,
                 'ToPort': 0,
                 'Protocol': '-1',
-                'CidrBlocks': ["0.0.0.0/0"]  # Restrict access to the internet
+                'CidrBlocks': ["0.0.0.0/0"]
             }
         ],
     )
@@ -179,10 +191,9 @@ def create_security_groups(vpc_id, destination_block):
                 'security_groups': [application_security_group.id],
             },
         ],
-        egress=[],
     )
 
-    security_group = [application_security_group, database_security_group]
+    security_group = [application_security_group, database_security_group, load_balancer_security_group]
 
     return security_group
 
@@ -195,7 +206,7 @@ def create_parameter_group():
     ))
 
 
-def create_rds_instance(subnet_id, database_security_group):
+def create_rds_instance(database_security_group):
     database_parameter_group = create_parameter_group()
     database_instance = aws.rds.Instance(
         "csye6225",
@@ -220,7 +231,7 @@ def create_rds_instance(subnet_id, database_security_group):
 def get_subnet_group():
     database_subnet_group = aws.rds.SubnetGroup(
         "csye6225subnetgroup",
-        subnet_ids=private_subnets,
+        subnet_ids=[subnet.id for subnet in private_subnets],
     )
     return database_subnet_group.name
 
@@ -271,7 +282,12 @@ def create_iam_role():
         role=iam_cloudwatch_role.name,
         policy_arn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
     )
-    return iam_cloudwatch_role
+
+    instance_profile = aws.iam.InstanceProfile(
+        "instance_profile",
+        role=iam_cloudwatch_role.name
+    )
+    return instance_profile
 
 
 def create_instance(ami_id, subnet_id, security_group):
@@ -296,7 +312,7 @@ def create_instance(ami_id, subnet_id, security_group):
         "#!/bin/bash",
         f"echo 'spring.jpa.hibernate.ddl-auto=update' >> {app_properties}",
         f"echo 'spring.datasource.hikari.initialization-fail-timeout=-1' >> {app_properties}",
-        f"echo 'spring.datasource.hikari.connection-timeout=2000' >> {app_properties}",
+        f"echo 'spring.datasource.hikari.connection-timeout=5000' >> {app_properties}",
         f"echo 'spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect' >> {app_properties}",
         f"echo 'logging.level.org.springframework=debug' >> {app_properties}",
         f"echo 'spring.datasource.username={rds_config.get('username')}' >> {app_properties}",
@@ -364,15 +380,271 @@ def create_instance(ami_id, subnet_id, security_group):
     ),
     return instance
 
+def create_user_data(rds_instance):
+    app_properties = '/tmp/applications.properties'
 
-def update_record_in_route53(instance):
+    rds_instance_hostname = pulumi.Output.concat(
+        "jdbc:postgresql://",
+        rds_instance,
+        ":5432/",
+        rds_config.get("db_name")
+    )
+
+    user_data = [
+        "#!/bin/bash",
+        f"echo 'spring.jpa.hibernate.ddl-auto=update' >> {app_properties}",
+        f"echo 'spring.datasource.hikari.initialization-fail-timeout=-1' >> {app_properties}",
+        f"echo 'spring.datasource.hikari.connection-timeout=2000' >> {app_properties}",
+        f"echo 'spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect' >> {app_properties}",
+        f"echo 'logging.level.org.springframework=debug' >> {app_properties}",
+        f"echo 'spring.datasource.username={rds_config.get('username')}' >> {app_properties}",
+        f"echo 'spring.datasource.password={rds_config.get('password')}' >> {app_properties}",
+        f"echo 'env.domain=localhost' >> {app_properties}",
+        f"echo 'env.port=8125' >> {app_properties}",
+        f"echo 'management.statsd.metrics.export.host=localhost' >> {app_properties}",
+        f"echo 'management.statsd.metrics.export.port=8125' >> {app_properties}",
+        f"echo 'management.endpoints.web.exposure.include=metrics' >> {app_properties}",
+    ]
+
+    user_data = pulumi.Output.concat(
+        "\n".join(user_data),
+        "\n",
+        rds_instance_hostname.apply(func=lambda x: f"echo 'spring.datasource.url={x}' >> {app_properties}"))
+
+    user_data = pulumi.Output.concat(user_data, f"\nsudo mv {app_properties} /opt/application.properties", "\n")
+    user_data = pulumi.Output.concat(user_data, "\nsudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+        -a fetch-config \
+        -m ec2 \
+        -c file:/opt/cloudwatch.json \
+        -s", "\n")
+    user_data = user_data.apply(
+        lambda data: base64.b64encode(data.encode()).decode())
+
+    return user_data
+
+
+def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id):
+
+    rds_instance = create_rds_instance(security_group[1].id)
+
+    app_properties = '/tmp/applications.properties'
+
+    rds_instance_hostname = pulumi.Output.concat(
+        "jdbc:postgresql://",
+        rds_instance,
+        ":5432/",
+        rds_config.get("db_name")
+    )
+
+    user_data = [
+        "#!/bin/bash",
+        f"echo 'spring.jpa.hibernate.ddl-auto=update' >> {app_properties}",
+        f"echo 'spring.datasource.hikari.initialization-fail-timeout=-1' >> {app_properties}",
+        f"echo 'spring.datasource.hikari.connection-timeout=2000' >> {app_properties}",
+        f"echo 'spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect' >> {app_properties}",
+        f"echo 'logging.level.org.springframework=debug' >> {app_properties}",
+        f"echo 'spring.datasource.username={rds_config.get('username')}' >> {app_properties}",
+        f"echo 'spring.datasource.password={rds_config.get('password')}' >> {app_properties}",
+        f"echo 'env.domain=localhost' >> {app_properties}",
+        f"echo 'env.port=8125' >> {app_properties}",
+        f"echo 'management.statsd.metrics.export.host=localhost' >> {app_properties}",
+        f"echo 'management.statsd.metrics.export.port=8125' >> {app_properties}",
+        f"echo 'management.endpoints.web.exposure.include=metrics' >> {app_properties}",
+    ]
+
+    user_data = pulumi.Output.concat(
+        "\n".join(user_data),
+        "\n",
+        rds_instance_hostname.apply(func=lambda x: f"echo 'spring.datasource.url={x}' >> {app_properties}"))
+
+    user_data = pulumi.Output.concat(user_data, f"\nsudo mv {app_properties} /opt/application.properties", "\n")
+    user_data = pulumi.Output.concat(user_data, "\nsudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+        -a fetch-config \
+        -m ec2 \
+        -c file:/opt/cloudwatch.json \
+        -s", "\n")
+    user_data = user_data.apply(
+        lambda data: base64.b64encode(data.encode()).decode())
+
+    # Create an IAM Role
+    iam_cloudwatch_role = aws.iam.Role(
+        "CloudWatch_Role",
+        assume_role_policy="""{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole",
+                "Sid": ""
+                }
+            ]
+        }""")
+    aws.iam.RolePolicyAttachment(
+        "CloudWatchAgentServerPolicy",
+        role=iam_cloudwatch_role.name,
+        policy_arn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+    )
+
+    instance_profile = aws.iam.InstanceProfile(
+        "instance_profile",
+        role=iam_cloudwatch_role.name
+    )
+
+    launch_template = aws.ec2.LaunchTemplate(
+        "AutoscalingLaunchConfig",
+        image_id=ami_id,
+        instance_type="t2.micro",
+        key_name="ec2",
+        user_data=user_data,
+        iam_instance_profile=aws.ec2.LaunchTemplateIamInstanceProfileArgs(
+            name=instance_profile.name,
+        ),
+        block_device_mappings=[{  # Array of mappings
+            "device_name": "/dev/xvda",  # Device name
+            "ebs": {
+                "volume_size": data.get("root_volume_size"),
+                "volume_type": data.get("root_volume_type"),
+                "delete_on_termination": True  # Terminate EBS volume on instance termination
+            },
+        }],
+        network_interfaces=[
+            aws.ec2.LaunchTemplateNetworkInterfaceArgs(
+                associate_public_ip_address=True,
+                security_groups=[security_group[0].id],
+                subnet_id=public_subnets[0],
+            ),
+        ],
+        disable_api_termination=False,
+    )
+
+    target_group = aws.lb.TargetGroup(
+        "webapp-target-group",
+        port=8080,
+        slow_start=30,
+        health_check=aws.lb.TargetGroupHealthCheckArgs(
+            path="/healthz",
+            port=8080,
+            matcher=200,
+            healthy_threshold=3,
+            unhealthy_threshold=3,
+            protocol="HTTP",
+            interval=10,
+        ),
+        protocol="HTTP",
+        target_type="instance",
+        vpc_id=vpc_id,
+    )
+
+    autoscaling_group = aws.autoscaling.Group(
+        "AutoscalingGroup",
+        min_size=1,
+        max_size=3,
+        desired_capacity=1,
+        default_cooldown=60,
+        default_instance_warmup=10,
+        health_check_type="ELB",
+        target_group_arns=[target_group.arn],
+        launch_template=aws.autoscaling.GroupLaunchTemplateArgs(
+            id=launch_template.id,
+            version="$Latest",
+        ),
+        vpc_zone_identifiers=[subnet.id for subnet in public_subnets],
+        health_check_grace_period=300,
+        tags=[
+            aws.autoscaling.GroupTagArgs(
+                key='Name',
+                value='ASGInstance',
+                propagate_at_launch=True,
+            )
+        ],
+    )
+
+    autoscaling_up_policy = aws.autoscaling.Policy(
+        "AutoScalingPolicyUp1",
+        adjustment_type="ChangeInCapacity",
+        policy_type="SimpleScaling",
+        autoscaling_group_name=autoscaling_group.name,
+        scaling_adjustment=1,
+        metric_aggregation_type="Average",
+    )
+
+    autoscaling_down_policy = aws.autoscaling.Policy(
+        "AutoScalingPolicyDown1",
+        adjustment_type="ChangeInCapacity",
+        policy_type="SimpleScaling",
+        autoscaling_group_name=autoscaling_group.name,
+        scaling_adjustment=-1,
+        metric_aggregation_type="Average",
+    )
+
+    # Create a CloudWatch metric alarm for scaling up.
+    scaling_up_alarm = aws.cloudwatch.MetricAlarm(
+        "ScalingUpAlarm",
+        comparison_operator="GreaterThanOrEqualToThreshold",
+        evaluation_periods=2,
+        metric_name="CPUUtilization",
+        namespace="AWS/EC2",
+        period=60,
+        statistic="Average",
+        threshold="5",
+        alarm_actions=[autoscaling_up_policy.arn],
+        dimensions={
+            "AutoScalingGroupName": autoscaling_group.name,
+        },
+    )
+
+    scaling_down_alarm = aws.cloudwatch.MetricAlarm(
+        "ScalingDownAlarm",
+        comparison_operator="LessThanOrEqualToThreshold",
+        evaluation_periods=1,
+        metric_name="CPUUtilization",
+        namespace="AWS/EC2",
+        period=60,
+        statistic="Average",
+        threshold="3",
+        alarm_actions=[autoscaling_down_policy.arn],
+        dimensions={
+            "AutoScalingGroupName": autoscaling_group.name,
+        },
+    )
+
+    load_balancer = aws.lb.LoadBalancer(
+        "webapp-alb",
+        load_balancer_type="application",
+        security_groups=[security_group[2].id],
+        enable_deletion_protection=False,
+        internal=False,
+        subnets=[subnets.id for subnets in public_subnets],
+    )
+
+    listener = aws.lb.Listener(
+        "webapp-listener",
+        default_actions=[
+            aws.lb.ListenerDefaultActionArgs(
+                type="forward",
+                target_group_arn=target_group.arn,
+            )],
+        load_balancer_arn=load_balancer.arn,
+        port=80,
+        protocol="HTTP",
+    )
+    return load_balancer
+
+
+def update_record_in_route53(lb):
     my_zone = aws.route53.get_zone(name=route53_config.get("name"))
     record = aws.route53.Record(
         "route53_record",
         type="A",
         name=my_zone.name,
-        ttl=60,
-        records=[instance.public_ip],
+        aliases=[aws.route53.RecordAliasArgs(
+            name=lb.dns_name,
+            zone_id=lb.zone_id,
+            evaluate_target_health=True,
+        )],
         zone_id=my_zone.zone_id
     )
     return record
@@ -386,8 +658,10 @@ def demo():
     security_group = create_security_groups(vpc_id, destination_block)
 
     # Create the EC2 instance.
-    instance = create_instance(data.get("ami_id"), public_subnets[0], security_group)
-    update_record_in_route53(instance[0])
+    # instance = create_instance(data.get("ami_id"), public_subnets[0], security_group)
+
+    load_balancer = autoscaling_ec2_instances(data.get("ami_id"), public_subnets[0], security_group, vpc_id)
+    update_record_in_route53(load_balancer)
 
 
 demo()
