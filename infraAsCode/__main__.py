@@ -2,6 +2,7 @@ import base64
 
 import pulumi
 import pulumi_aws as aws
+import pulumi_gcp as gcp
 import ipaddress
 
 
@@ -24,6 +25,7 @@ config = pulumi.Config()
 data = config.require_object("data")
 rds_config = config.require_object("rds")
 route53_config = config.require_object("route53")
+gcp_project = config.require_object("gcp")
 
 # Extract key configuration values
 vpc_name = data.get("vpcName")
@@ -380,6 +382,7 @@ def create_instance(ami_id, subnet_id, security_group):
     ),
     return instance
 
+
 def create_user_data(rds_instance):
     app_properties = '/tmp/applications.properties'
 
@@ -423,8 +426,7 @@ def create_user_data(rds_instance):
     return user_data
 
 
-def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id):
-
+def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id, sns_topic):
     rds_instance = create_rds_instance(security_group[1].id)
 
     app_properties = '/tmp/applications.properties'
@@ -447,6 +449,9 @@ def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id):
         f"echo 'spring.datasource.password={rds_config.get('password')}' >> {app_properties}",
         f"echo 'env.domain=localhost' >> {app_properties}",
         f"echo 'env.port=8125' >> {app_properties}",
+        f"echo 'sns.topic.arn={sns_topic.arn}' >> {app_properties}",
+        f"echo 'AWS_ACCESS_KEY_ID=AKIAWVMVSLDTCLEP377Z' >> {app_properties}",
+        f"echo 'AWS_SECRET_ACCESS_KEY=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' >> {app_properties}",
         f"echo 'management.statsd.metrics.export.host=localhost' >> {app_properties}",
         f"echo 'management.statsd.metrics.export.port=8125' >> {app_properties}",
         f"echo 'management.endpoints.web.exposure.include=metrics' >> {app_properties}",
@@ -463,6 +468,7 @@ def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id):
         -m ec2 \
         -c file:/opt/cloudwatch.json \
         -s", "\n")
+
     user_data = user_data.apply(
         lambda data: base64.b64encode(data.encode()).decode())
 
@@ -486,6 +492,12 @@ def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id):
         "CloudWatchAgentServerPolicy",
         role=iam_cloudwatch_role.name,
         policy_arn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+    )
+
+    aws.iam.RolePolicyAttachment(
+        "SNSServerPolicy",
+        role=iam_cloudwatch_role.name,
+        policy_arn="arn:aws:iam::aws:policy/AmazonSNSFullAccess"
     )
 
     instance_profile = aws.iam.InstanceProfile(
@@ -660,7 +672,121 @@ def demo():
     # Create the EC2 instance.
     # instance = create_instance(data.get("ami_id"), public_subnets[0], security_group)
 
-    load_balancer = autoscaling_ec2_instances(data.get("ami_id"), public_subnets[0], security_group, vpc_id)
+    sns_topic = aws.sns.Topic('my-topic')
+
+    bucket = gcp.storage.Bucket(
+        'my-bucket-new',
+        location="US-EAST1",
+        project=gcp_project.get("project_id"),
+        force_destroy=True,
+    )
+    service_account = gcp.serviceaccount.Account(
+        "serviceAccount",
+        account_id="csye6225-service-account",
+        display_name="Service Account",
+        project=gcp_project.get("project_id"),
+    )
+
+    my_key = gcp.serviceaccount.Key(
+        "mykey",
+        service_account_id=service_account.name,
+        public_key_type="TYPE_X509_PEM_FILE")
+
+    # Grant the service account access to the bucket
+    bucket_access = gcp.storage.BucketAccessControl(
+        'bucket-access',
+        bucket=bucket.name,
+        role='WRITER',
+        entity=service_account.email.apply(lambda id: f'user-{id}')
+    )
+
+    basic_dynamodb_table = aws.dynamodb.Table(
+        "dynamodb_table",
+        attributes=[aws.dynamodb.TableAttributeArgs(
+            name='id',
+            type='S',
+        )],
+        hash_key='id',
+        read_capacity=20,
+        write_capacity=20,
+    )
+
+    # Create IAM ROle for lambda function
+    lambda_role = aws.iam.Role(
+        "lambda_role",
+        assume_role_policy="""{
+            "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Action": "sts:AssumeRole",
+                        "Principal": {
+                            "Service": "lambda.amazonaws.com"
+                        },
+                        "Effect": "Allow",
+                        "Sid": ""
+                    }
+                ]
+            }""")
+
+    outp = pulumi.Output.concat("LAMBDA NAME: ", lambda_role.name)
+    outp.apply(lambda id: print(f"Hello, {id}!"))
+
+    outp = pulumi.Output.concat("LAMBDA ID : ", lambda_role.id)
+    outp.apply(lambda id: print(f"Hello, {id}!"))
+
+    # # Attaching CloudWatchLogsFullAccess Policy to the role
+    aws.iam.RolePolicyAttachment(
+        "lambda_policy",
+        role=lambda_role.name,
+        policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    )
+
+    # Create Lambda function
+    lambda_function = aws.lambda_.Function(
+        "lambda_function",
+        role=lambda_role.arn,
+        runtime="python3.10",
+        handler="lambda_function.lambda_handler",
+        code=pulumi.AssetArchive({
+            ".": pulumi.FileArchive(
+                r"C:\Users\vedan\CSYE6225\serverless\my_deployment_package.zip")
+        }),
+        environment=aws.lambda_.FunctionEnvironmentArgs(
+            variables={
+                "SNS_TOPIC_ARN": sns_topic.arn,
+                "GOOGLE_CREDENTIALS": my_key.private_key,
+                "GCP_BUCKET_NAME": bucket.id,
+                "FROM_ADDRESS": "noreply@" + route53_config.get("domain_name"),
+                "DYNAMO_TABLE_NAME": basic_dynamodb_table.id,
+            }
+        ),
+        tags={
+            "Name": "lambda_function",
+        },
+    )
+    # Create Lambda Subscription
+    lambda_subscription = aws.sns.TopicSubscription(
+        "lambda_subscription",
+        endpoint=lambda_function.arn,
+        protocol="lambda",
+        topic=sns_topic.arn,
+    )
+
+    aws.iam.RolePolicyAttachment(
+        "lambda_policy-dynamoDB",
+        role=lambda_role.name,
+        policy_arn="arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess")
+
+    # Create Lambda Permission
+    lambda_permission = aws.lambda_.Permission(
+        "lambda_permission",
+        action="lambda:InvokeFunction",
+        function=lambda_function.name,
+        principal="sns.amazonaws.com",
+        source_arn=sns_topic.arn,
+    )
+
+    load_balancer = autoscaling_ec2_instances(data.get("ami_id"), public_subnets[0], security_group, vpc_id, sns_topic)
     update_record_in_route53(load_balancer)
 
 
