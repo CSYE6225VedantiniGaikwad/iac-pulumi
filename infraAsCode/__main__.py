@@ -449,7 +449,6 @@ def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id, sns_top
         f"echo 'spring.datasource.password={rds_config.get('password')}' >> {app_properties}",
         f"echo 'env.domain=localhost' >> {app_properties}",
         f"echo 'env.port=8125' >> {app_properties}",
-        f"echo 'sns.topic.arn={sns_topic.arn}' >> {app_properties}",
         f"echo 'AWS_ACCESS_KEY_ID=AKIAWVMVSLDTCLEP377Z' >> {app_properties}",
         f"echo 'AWS_SECRET_ACCESS_KEY=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' >> {app_properties}",
         f"echo 'management.statsd.metrics.export.host=localhost' >> {app_properties}",
@@ -457,10 +456,15 @@ def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id, sns_top
         f"echo 'management.endpoints.web.exposure.include=metrics' >> {app_properties}",
     ]
 
+    topic_arn = pulumi.Output.concat("", sns_topic.arn)
+
     user_data = pulumi.Output.concat(
         "\n".join(user_data),
         "\n",
-        rds_instance_hostname.apply(func=lambda x: f"echo 'spring.datasource.url={x}' >> {app_properties}"))
+        rds_instance_hostname.apply(func=lambda x: f"echo 'spring.datasource.url={x}' >> {app_properties}"),
+        "\n",
+        topic_arn.apply(func=lambda x: f"echo 'sns.topic.arn={x}' >> {app_properties}")
+    )
 
     user_data = pulumi.Output.concat(user_data, f"\nsudo mv {app_properties} /opt/application.properties", "\n")
     user_data = pulumi.Output.concat(user_data, "\nsudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
@@ -632,6 +636,10 @@ def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id, sns_top
         subnets=[subnets.id for subnets in public_subnets],
     )
 
+    ssl_certificate = aws.acm.get_certificate(domain=route53_config.get("name"),
+                                              most_recent=True,
+    )
+
     listener = aws.lb.Listener(
         "webapp-listener",
         default_actions=[
@@ -640,8 +648,9 @@ def autoscaling_ec2_instances(ami_id, subnet_id, security_group, vpc_id, sns_top
                 target_group_arn=target_group.arn,
             )],
         load_balancer_arn=load_balancer.arn,
-        port=80,
-        protocol="HTTP",
+        certificate_arn=ssl_certificate.arn,
+        port=443,
+        protocol="HTTPS",
     )
     return load_balancer
 
@@ -760,6 +769,7 @@ def demo():
                 "DYNAMO_TABLE_NAME": basic_dynamodb_table.id,
             }
         ),
+        timeout=60,
         tags={
             "Name": "lambda_function",
         },

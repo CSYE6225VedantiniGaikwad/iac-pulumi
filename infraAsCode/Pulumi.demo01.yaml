@@ -9,7 +9,7 @@ config:
     destination_cidr_block: 0.0.0.0/0
     root_volume_size: 25
     root_volume_type: gp2
-    ami_id: ami-0fc94024d8fa74576
+    ami_id: ami-07cbe7cb4983bba47
     no_of_subnets_AZ: 3
   rds:
     storage_type: gp2
