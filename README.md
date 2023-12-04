@@ -46,3 +46,6 @@ Use the following commands to destroy all resources that are created on a stack:
 
 #### Using pulumi ####
     pulumi destroy
+
+#### Command to import certificate into AWS Certificate Manager ####
+    aws acm import-certificate --profile demo01 --certificate fileb://demo_vedantinigaikwad_me.crt --private-key fileb://"C:\Program Files\OpenSSL-Win64\bin\private.key"
